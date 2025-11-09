@@ -65,6 +65,14 @@ def patch_model_loading(monkeypatch):
     monkeypatch.setattr(LocalEmbedder, "__init__", fake_init)
 
 
+def _stub_embeddings(monkeypatch, vectors: dict[str, _SimpleArray]) -> None:
+    def fake_embed_texts(self, texts, batch_size=16):
+        arrs = [vectors[text] for text in texts]
+        return _SimpleArray.vstack(arrs)
+
+    monkeypatch.setattr(LocalEmbedder, "embed_texts", fake_embed_texts)
+
+
 def test_index_and_search_roundtrip(tmp_path: Path, sample_cards, monkeypatch):
     embedder = LocalEmbedder()
     embedder.index_dir = tmp_path
@@ -76,11 +84,7 @@ def test_index_and_search_roundtrip(tmp_path: Path, sample_cards, monkeypatch):
         "search": _SimpleArray([[1.0, 0.0, 0.0]]),
     }
 
-    def fake_embed_texts(self, texts, batch_size=16):
-        arrs = [vectors[text] for text in texts]
-        return _SimpleArray.vstack(arrs)
-
-    monkeypatch.setattr(LocalEmbedder, "embed_texts", fake_embed_texts)
+    _stub_embeddings(monkeypatch, vectors)
 
     embedder.index_symbol_cards(sample_cards, index_name="sample", metadata_filename="meta.jsonl")
     results = embedder.search("search", index_name="sample", metadata_filename="meta.jsonl")
@@ -97,3 +101,22 @@ def test_index_symbol_cards_requires_cards(tmp_path: Path):
     embedder.index_dir = tmp_path
     with pytest.raises(ValueError):
         embedder.index_symbol_cards([], index_name="empty")
+
+
+def test_fallback_index_format(tmp_path: Path, sample_cards, monkeypatch):
+    embedder = LocalEmbedder()
+    embedder.index_dir = tmp_path
+
+    vectors = {
+        "int add(int a, int b)\n\nAdds two numbers\n\n0001: // Example\n0002: int add(int a, int b) { return a + b; }": _SimpleArray(
+            [[0.5, 0.5, 0.5]]
+        ),
+    }
+
+    _stub_embeddings(monkeypatch, vectors)
+
+    index_path = embedder.index_symbol_cards(sample_cards, index_name="fallback")
+    payload = json.loads(index_path.read_text())
+
+    assert index_path.name == "fallback.faiss"
+    assert payload == {"vectors": [[0.5, 0.5, 0.5]]}
