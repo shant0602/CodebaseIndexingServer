@@ -79,22 +79,80 @@ uvicorn src.server.rag_api:APP --reload
 ## Running with Docker
 
 A reproducible environment is available via the repository `Dockerfile`. It
-bundles libclang, FAISS, the embedding stack, and the FastAPI server. Build the
-image from the repository root:
+bundles libclang, FAISS, the embedding stack, and the FastAPI server so you can
+launch the API without installing local Python dependencies.
+
+### 1. Build the image
+
+Run the following command from the repository root to build the image. The
+resulting image is tagged as `cpp-rag`, but you can pick any name that fits your
+workflow.
 
 ```bash
 docker build -t cpp-rag .
 ```
 
-Run the container and map the service to port `8000` on the host:
+### 2. Start the API server
+
+Expose port `8000` from the container to your host and start the default
+entrypoint (Uvicorn serving `src.server.rag_api:APP`):
 
 ```bash
 docker run --rm -p 8000:8000 cpp-rag
 ```
 
+After the server boots, visit <http://localhost:8000/docs> to explore the OpenAPI
+schema, or send requests to `/index` and `/search` as shown below.
+
+### 3. Run CLI utilities or custom commands
+
+To execute one-off commands—such as parsing a repository or kicking off an
+embedding job—override the default command. Mount your source repository and
+vector output directory so the container can read and write files on the host:
+
+```bash
+docker run --rm \
+  -v /absolute/path/to/project:/data/project \
+  -v /absolute/path/to/vector_store:/data/vector_store \
+  cpp-rag \
+  python -m src.scripts.build_cpp_index \
+    --project-root /data/project \
+    --output-dir /data/vector_store
+```
+
+**Note:** The script will automatically generate `compile_commands.json` inside the container if it doesn't exist (using CMake). This ensures all paths are correct for the container environment. To disable this behavior, use `--no-generate-compile-commands`.
+
+The CLI accepts additional flags for advanced scenarios:
+
+- `--generate-compile-commands` (default: enabled) automatically generates `compile_commands.json` using CMake if missing.
+- `--no-generate-compile-commands` disables automatic generation and fails if `compile_commands.json` doesn't exist.
+- `--compile-commands` for non-standard locations of `compile_commands.json`.
+- `--model-name` to swap the embedding backbone used by `LocalEmbedder`.
+- `--device` to pin inference to `cpu` or a specific CUDA device.
+- `--context-lines` to control how many extra lines are captured in symbol snippets.
+
+Replace the module invocation with whichever script or CLI you need to run. You
+can also open an interactive shell for debugging:
+
+```bash
+docker run --rm -it cpp-rag /bin/bash
+```
+
+### Environment variables
+
 The container entrypoint automatically wires `LIBCLANG_PATH` if it is not set,
-so the parser can load libclang without additional configuration. Mount project
-sources or indexes as volumes when invoking the parser or embedder utilities.
+so the parser can load libclang without additional configuration. If you need to
+override the model that backs `LocalEmbedder`, supply `EMBEDDING_MODEL_NAME` at
+runtime:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e EMBEDDING_MODEL_NAME="sentence-transformers/all-MiniLM-L6-v2" \
+  cpp-rag
+```
+
+Mount project sources or indexes as volumes when invoking the parser or
+embedder utilities to persist data outside the container.
 
 ### Indexing via the API
 
