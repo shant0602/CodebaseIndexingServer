@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
-import subprocess
 import shutil
+import subprocess
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -70,6 +72,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override the embedding model used by LocalEmbedder.",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading models with custom code (required for some NVIDIA models like NV-EmbedCode).",
+    )
+    parser.add_argument(
         "--device",
         help="Force the device for embedding computations (e.g., cpu or cuda).",
     )
@@ -78,6 +85,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=2,
         help="Number of context lines to include above and below each symbol snippet.",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=8,
+        help="Batch size for embedding generation. Reduce if running out of GPU memory. Default: 8",
+    )
+    parser.add_argument(
+        "--embedding-chunk-size",
+        type=int,
+        default=1000,
+        help="Number of cards to process in each chunk before writing to index. Reduces memory usage. Default: 1000",
+    )
+    parser.add_argument(
+        "--cards-jsonl",
+        type=Path,
+        help="Optional path to write symbol cards as JSONL after generation.",
+    )
+    parser.add_argument(
+        "--resume-from-cards",
+        type=Path,
+        help="Skip parsing and load symbol cards from an existing JSONL file.",
+    )
+    parser.add_argument(
+        "--skip-embedding",
+        action="store_true",
+        help="Generate or load symbol cards but exit before embedding them.",
     )
     parser.add_argument(
         "--log-level",
@@ -122,7 +156,17 @@ def generate_compile_commands(project_root: Path, output_path: Path) -> bool:
         # Clean build directory if it exists (to remove old CMakeCache.txt from host)
         if build_dir.exists():
             LOGGER.info("Removing existing build directory to ensure clean CMake configuration...")
-            shutil.rmtree(build_dir)
+            try:
+                shutil.rmtree(build_dir)
+            except (PermissionError, OSError) as e:
+                # If we can't remove the whole directory, try to remove just CMakeCache.txt
+                LOGGER.warning("Could not remove build directory (%s), attempting to remove CMakeCache.txt only", e)
+                cmake_cache = build_dir / "CMakeCache.txt"
+                if cmake_cache.exists():
+                    try:
+                        cmake_cache.unlink()
+                    except (PermissionError, OSError):
+                        LOGGER.warning("Could not remove CMakeCache.txt, CMake may use cached values")
         
         # Create fresh build directory
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +183,17 @@ def generate_compile_commands(project_root: Path, output_path: Path) -> bool:
             "-DCMAKE_FIND_PACKAGE_PREFER_CONFIG=OFF",
             # Allow configuration to continue even with missing packages
             "-Wno-dev",
+            # Unset cached test flags first, then set them to ON
+            # This ensures they override any existing cache values
+            "-Ugmock_build_tests",
+            "-Ugtest_build_tests",
+            "-Ugtest_build_samples",
+            "-UBUILD_TESTING",
+            # Enable tests and samples to include all files in compile_commands.json
+            "-Dgmock_build_tests=ON",
+            "-Dgtest_build_tests=ON",
+            "-Dgtest_build_samples=ON",
+            "-DBUILD_TESTING=ON",
         ]
         
         # Try to set environment variables to help find packages or skip them
@@ -209,6 +264,30 @@ def collect_symbol_cards(
     return cards
 
 
+def dump_symbol_cards_jsonl(cards: Sequence[SymbolCard], output_path: Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for card in cards:
+            json.dump(asdict(card), handle)
+            handle.write("\n")
+    tmp_path.replace(output_path)
+    return output_path
+
+
+def load_symbol_cards_jsonl(path: Path) -> List[SymbolCard]:
+    cards: List[SymbolCard] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            cards.append(SymbolCard(**payload))
+    return cards
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging(args.log_level)
@@ -216,90 +295,102 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine compile_commands.json path
-    if args.compile_commands:
-        compile_commands_path = Path(args.compile_commands)
+    cards: List[SymbolCard]
+    if args.resume_from_cards:
+        resume_path = Path(args.resume_from_cards)
+        if not resume_path.exists():
+            LOGGER.error("Symbol card snapshot not found: %s", resume_path)
+            return 1
+        cards = load_symbol_cards_jsonl(resume_path)
+        if not cards:
+            LOGGER.warning("No symbol cards loaded from %s. Exiting.", resume_path)
+            return 0
+        LOGGER.info("Loaded %s symbol cards from %s", len(cards), resume_path)
     else:
-        compile_commands_path = args.project_root / "compile_commands.json"
-    
-    # Check if compile_commands.json exists and if it has valid container paths
-    needs_regeneration = False
-    if compile_commands_path.exists():
-        # Check if the file contains host paths that don't exist in container
-        try:
-            import json
-            with open(compile_commands_path, 'r') as f:
-                content = f.read()
-                # Check for common host path patterns that won't work in container
-                if '/Users/' in content or '/home/' in content:
-                    # Check if referenced build directories exist
-                    if '/build/' in content:
-                        build_paths = [line for line in content.split('\n') if '/build/' in line]
-                        # Sample a few paths to see if they exist
+        if args.compile_commands:
+            compile_commands_path = Path(args.compile_commands)
+        else:
+            compile_commands_path = args.project_root / "compile_commands.json"
+
+        needs_regeneration = False
+        if compile_commands_path.exists():
+            try:
+                content = compile_commands_path.read_text(encoding="utf-8")
+                if "/Users/" in content or "/home/" in content:
+                    if "/build/" in content:
                         import re
-                        for line in build_paths[:5]:  # Check first 5 build path references
+
+                        build_paths = [line for line in content.split("\n") if "/build/" in line]
+                        for line in build_paths[:5]:
                             matches = re.findall(r'["\']([^"\']*build[^"\']*)["\']', line)
                             for match in matches:
-                                if match.startswith('/') and not Path(match).exists():
+                                if match.startswith("/") and not Path(match).exists():
                                     needs_regeneration = True
-                                    LOGGER.info("Found non-existent build paths in compile_commands.json. Will regenerate.")
+                                    LOGGER.info(
+                                        "Found non-existent build paths in compile_commands.json. Will regenerate."
+                                    )
                                     break
                             if needs_regeneration:
                                 break
-        except Exception as exc:
-            LOGGER.warning("Could not check compile_commands.json validity: %s", exc)
-    
-    # Generate compile_commands.json if it doesn't exist or needs regeneration
-    if not compile_commands_path.exists() or needs_regeneration:
-        if args.generate_compile_commands:
-            if needs_regeneration:
-                LOGGER.info("compile_commands.json contains invalid paths. Regenerating it...")
-                # Backup old file
-                backup_path = compile_commands_path.with_suffix('.json.bak')
-                if compile_commands_path.exists():
-                    shutil.move(str(compile_commands_path), str(backup_path))
-                    LOGGER.info("Backed up old compile_commands.json to %s", backup_path)
+            except Exception as exc:
+                LOGGER.warning("Could not check compile_commands.json validity: %s", exc)
+
+        if not compile_commands_path.exists() or needs_regeneration:
+            if args.generate_compile_commands:
+                if needs_regeneration:
+                    LOGGER.info("compile_commands.json contains invalid paths. Regenerating it...")
+                    backup_path = compile_commands_path.with_suffix(".json.bak")
+                    if compile_commands_path.exists():
+                        shutil.move(str(compile_commands_path), str(backup_path))
+                        LOGGER.info("Backed up old compile_commands.json to %s", backup_path)
+                else:
+                    LOGGER.info("compile_commands.json not found. Generating it automatically...")
+                if not generate_compile_commands(args.project_root, compile_commands_path):
+                    LOGGER.error("Failed to generate compile_commands.json")
+                    return 1
             else:
-                LOGGER.info("compile_commands.json not found. Generating it automatically...")
-            if not generate_compile_commands(args.project_root, compile_commands_path):
-                LOGGER.error("Failed to generate compile_commands.json")
+                LOGGER.error(
+                    "compile_commands.json not found or invalid at %s. "
+                    "Use --generate-compile-commands (default) to generate it automatically, "
+                    "or generate it manually using CMake.",
+                    compile_commands_path,
+                )
                 return 1
-        else:
-            LOGGER.error(
-                "compile_commands.json not found or invalid at %s. "
-                "Use --generate-compile-commands (default) to generate it automatically, "
-                "or generate it manually using CMake.",
-                compile_commands_path
-            )
-            return 1
 
-    # Use --clang-library-path if provided, otherwise try LIBCLANG_PATH env var
-    clang_library_path = args.clang_library_path
-    if clang_library_path is None:
-        libclang_env = os.environ.get("LIBCLANG_PATH")
-        if libclang_env:
-            clang_library_path = Path(libclang_env)
-            # If it's a file, use it directly; if it's a directory, keep it as directory
-            # Parser will handle both cases
+        clang_library_path = args.clang_library_path
+        if clang_library_path is None:
+            libclang_env = os.environ.get("LIBCLANG_PATH")
+            if libclang_env:
+                clang_library_path = Path(libclang_env)
 
-    parser = CppParser(
-        project_root=args.project_root,
-        compile_commands=compile_commands_path,
-        clang_library_path=clang_library_path,
-    )
+        parser = CppParser(
+            project_root=args.project_root,
+            compile_commands=compile_commands_path,
+            clang_library_path=clang_library_path,
+        )
 
-    LOGGER.info("Parsing translation units under %s", args.project_root)
-    symbols = list(parser.parse())
-    if not symbols:
-        LOGGER.warning("No symbols discovered. Exiting without writing an index.")
+        LOGGER.info("Parsing translation units under %s", args.project_root)
+        symbols = list(parser.parse())
+        if not symbols:
+            LOGGER.warning("No symbols discovered. Exiting without writing an index.")
+            return 0
+
+        LOGGER.info("Collected %s symbols. Building symbol cards.", len(symbols))
+        cards = collect_symbol_cards(symbols, args.context_lines)
+
+    if args.cards_jsonl:
+        dump_symbol_cards_jsonl(cards, args.cards_jsonl)
+        LOGGER.info("Wrote %s symbol cards to %s", len(cards), Path(args.cards_jsonl))
+
+    if args.skip_embedding:
+        LOGGER.info("Skipping embedding per --skip-embedding")
         return 0
-
-    LOGGER.info("Collected %s symbols. Building symbol cards.", len(symbols))
-    cards = collect_symbol_cards(symbols, args.context_lines)
 
     embedder_kwargs = {"index_dir": output_dir, "device": args.device}
     if args.model_name:
         embedder_kwargs["model_name"] = args.model_name
+    if args.trust_remote_code:
+        embedder_kwargs["trust_remote_code"] = True
 
     embedder = LocalEmbedder(**embedder_kwargs)
     LOGGER.info(
@@ -311,6 +402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cards,
         index_name=args.index_name,
         metadata_filename=args.metadata_filename,
+        batch_size=args.embedding_batch_size,
+        chunk_size=args.embedding_chunk_size,
     )
 
     LOGGER.info("Index written to %s", index_path)

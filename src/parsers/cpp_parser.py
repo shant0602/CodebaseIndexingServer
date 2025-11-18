@@ -184,7 +184,9 @@ class CppParser:
         skipped_extensions = 0
         skipped_missing = 0
         skipped_excluded = 0
+        skipped_duplicates = 0
         parsed_successfully = 0
+        failed_files: List[Tuple[Path, str]] = []
         
         commands = list(self._compilation_db.getAllCompileCommands())
         total_commands = len(commands)
@@ -215,6 +217,7 @@ class CppParser:
             
             source = source.resolve()
             if source in seen:
+                skipped_duplicates += 1
                 continue
             seen.add(source)
 
@@ -339,28 +342,31 @@ class CppParser:
                 parsed_successfully += 1
             except cindex.TranslationUnitLoadError as exc:
                 error_msg = str(exc)
-                # Log a sample of failed files with more context
-                if parsed_successfully == 0 and skipped_missing < 3:
-                    LOGGER.warning("Failed to parse %s: %s (sample args: %s)", source, error_msg, remapped_args[:5])
-                else:
+                failed_files.append((source, error_msg))
+                # Log first few failures immediately for debugging
+                if len(failed_files) <= 5:
                     LOGGER.warning("Failed to parse %s: %s", source, error_msg)
                 continue
             yield source, tu
             if idx % 25 == 0 or idx == total_commands:
                 LOGGER.info(
-                    "Processed %d/%d commands (parsed=%d, skipped_extensions=%d, skipped_missing=%d, skipped_excluded=%d)",
+                    "Processed %d/%d commands (parsed=%d, skipped_extensions=%d, skipped_missing=%d, skipped_excluded=%d, skipped_duplicates=%d)",
                     idx,
                     total_commands,
                     parsed_successfully,
                     skipped_extensions,
                     skipped_missing,
                     skipped_excluded,
+                    skipped_duplicates,
                 )
 
+        failed_count = len(failed_files)
         LOGGER.info(
-            "Translation unit processing summary: total=%d, skipped_extensions=%d, skipped_missing=%d, skipped_excluded=%d, parsed_successfully=%d",
-            total_commands, skipped_extensions, skipped_missing, skipped_excluded, parsed_successfully
+            "Translation unit processing summary: total=%d, skipped_extensions=%d, skipped_missing=%d, skipped_excluded=%d, skipped_duplicates=%d, parsed_successfully=%d, failed=%d",
+            total_commands, skipped_extensions, skipped_missing, skipped_excluded, skipped_duplicates, parsed_successfully, failed_count
         )
+        if failed_files and failed_count > 5:
+            LOGGER.info("First 5 failed files were logged above. Total failed: %d", failed_count)
 
     def _extract_symbols(
         self,

@@ -23,8 +23,12 @@ embeddings, and query them via the RAG API server.
    Transformers:
 
    ```bash
-   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+   pip install -r requirements.txt
    ```
+   
+   The requirements file pins the CUDA 12.1 wheel for PyTorch on Linux/x86_64 so
+   embeddings can run on GPU-equipped hosts. On other platforms the generic
+   PyTorch build is installed automatically.
 
 ## Parsing and Building Symbol Cards
 
@@ -130,6 +134,9 @@ The CLI accepts additional flags for advanced scenarios:
 - `--model-name` to swap the embedding backbone used by `LocalEmbedder`.
 - `--device` to pin inference to `cpu` or a specific CUDA device.
 - `--context-lines` to control how many extra lines are captured in symbol snippets.
+- `--cards-jsonl /path/to/cards.jsonl` to dump every generated symbol card as JSONL before embedding.
+- `--skip-embedding` to stop after parsing (useful when you only need the dumped cards).
+- `--resume-from-cards /path/to/cards.jsonl` to skip parsing entirely and embed an existing snapshot of symbol cards—handy when moving work to a GPU host.
 
 Replace the module invocation with whichever script or CLI you need to run. You
 can also open an interactive shell for debugging:
@@ -153,6 +160,34 @@ docker run --rm -p 8000:8000 \
 
 Mount project sources or indexes as volumes when invoking the parser or
 embedder utilities to persist data outside the container.
+
+### Offloading embedding to another machine
+
+The indexing CLI can checkpoint symbol cards so you can run parsing and
+embedding on different machines (for example, parse on CPU and embed on GPU):
+
+1. Run the parser and dump the cards without embedding:
+
+   ```bash
+   python -m src.scripts.build_cpp_index \
+     --project-root /data/project \
+     --output-dir /data/vector_store \
+     --cards-jsonl /data/vector_store/cards.jsonl \
+     --skip-embedding
+   ```
+
+2. Copy `/data/vector_store/cards.jsonl` to the target machine (or shared
+   storage) and resume from that snapshot:
+
+   ```bash
+   python -m src.scripts.build_cpp_index \
+     --project-root /data/project \
+     --output-dir /data/vector_store \
+     --resume-from-cards /data/vector_store/cards.jsonl
+   ```
+
+The second invocation loads the previously dumped cards and immediately starts
+embedding them with `LocalEmbedder`, avoiding another clang parse pass.
 
 ### Indexing via the API
 

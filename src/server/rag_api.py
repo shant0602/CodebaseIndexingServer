@@ -125,9 +125,11 @@ class SearchResponse(BaseModel):
 
 def get_embedder() -> LocalEmbedder:
     if not hasattr(get_embedder, "_instance"):
+        trust_remote_code = os.getenv("CPP_EMBEDDER_TRUST_REMOTE_CODE", "false").lower() == "true"
         get_embedder._instance = LocalEmbedder(  # type: ignore[attr-defined]
             model_name=os.getenv("CPP_EMBEDDER_MODEL", "BAAI/bge-small-en-v1.5"),
             index_dir=Path(os.getenv("CPP_EMBEDDER_INDEX_DIR", ".cpp_vector")),
+            trust_remote_code=trust_remote_code,
         )
     return get_embedder._instance  # type: ignore[attr-defined]
 
