@@ -72,6 +72,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override the embedding model used by LocalEmbedder.",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading models with custom code (required for some NVIDIA models like NV-EmbedCode).",
+    )
+    parser.add_argument(
         "--device",
         help="Force the device for embedding computations (e.g., cpu or cuda).",
     )
@@ -80,6 +85,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=2,
         help="Number of context lines to include above and below each symbol snippet.",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=8,
+        help="Batch size for embedding generation. Reduce if running out of GPU memory. Default: 8",
+    )
+    parser.add_argument(
+        "--embedding-chunk-size",
+        type=int,
+        default=1000,
+        help="Number of cards to process in each chunk before writing to index. Reduces memory usage. Default: 1000",
     )
     parser.add_argument(
         "--cards-jsonl",
@@ -139,7 +156,17 @@ def generate_compile_commands(project_root: Path, output_path: Path) -> bool:
         # Clean build directory if it exists (to remove old CMakeCache.txt from host)
         if build_dir.exists():
             LOGGER.info("Removing existing build directory to ensure clean CMake configuration...")
-            shutil.rmtree(build_dir)
+            try:
+                shutil.rmtree(build_dir)
+            except (PermissionError, OSError) as e:
+                # If we can't remove the whole directory, try to remove just CMakeCache.txt
+                LOGGER.warning("Could not remove build directory (%s), attempting to remove CMakeCache.txt only", e)
+                cmake_cache = build_dir / "CMakeCache.txt"
+                if cmake_cache.exists():
+                    try:
+                        cmake_cache.unlink()
+                    except (PermissionError, OSError):
+                        LOGGER.warning("Could not remove CMakeCache.txt, CMake may use cached values")
         
         # Create fresh build directory
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +183,17 @@ def generate_compile_commands(project_root: Path, output_path: Path) -> bool:
             "-DCMAKE_FIND_PACKAGE_PREFER_CONFIG=OFF",
             # Allow configuration to continue even with missing packages
             "-Wno-dev",
+            # Unset cached test flags first, then set them to ON
+            # This ensures they override any existing cache values
+            "-Ugmock_build_tests",
+            "-Ugtest_build_tests",
+            "-Ugtest_build_samples",
+            "-UBUILD_TESTING",
+            # Enable tests and samples to include all files in compile_commands.json
+            "-Dgmock_build_tests=ON",
+            "-Dgtest_build_tests=ON",
+            "-Dgtest_build_samples=ON",
+            "-DBUILD_TESTING=ON",
         ]
         
         # Try to set environment variables to help find packages or skip them
@@ -351,6 +389,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     embedder_kwargs = {"index_dir": output_dir, "device": args.device}
     if args.model_name:
         embedder_kwargs["model_name"] = args.model_name
+    if args.trust_remote_code:
+        embedder_kwargs["trust_remote_code"] = True
 
     embedder = LocalEmbedder(**embedder_kwargs)
     LOGGER.info(
@@ -362,6 +402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cards,
         index_name=args.index_name,
         metadata_filename=args.metadata_filename,
+        batch_size=args.embedding_batch_size,
+        chunk_size=args.embedding_chunk_size,
     )
 
     LOGGER.info("Index written to %s", index_path)
